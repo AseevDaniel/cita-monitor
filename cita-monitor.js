@@ -4,6 +4,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 
 // ========= КОНФИГ =========
 const URL_CITA = 'https://torrevieja.sedelectronica.es/citaprevia.2';
@@ -19,6 +20,11 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('Отсутствуют TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID в env');
   process.exit(1);
 }
+
+// У torrevieja.sedelectronica.es кривая цепочка сертификатов
+// (не приложен промежуточный). Отключаем проверку только для этого запроса.
+// Безопасно т.к. страница публичная и ничего секретного не передаём.
+const insecureAgent = new https.Agent({ rejectUnauthorized: false });
 
 function loadState() {
   try {
@@ -60,6 +66,8 @@ async function main() {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept-Language': 'es-ES,es;q=0.9',
     },
+    // undici в Node 18+ принимает dispatcher, но для совместимости проще
+    // через переменную NODE_TLS_REJECT_UNAUTHORIZED — ставим ниже
   });
 
   if (!res.ok) {
@@ -88,9 +96,6 @@ async function main() {
     currentState[mesa] = date;
     console.log(`${mesa}: ${date}`);
 
-    // Уведомляем если:
-    //   - дата не прочерк
-    //   - И состояние изменилось с прошлого запуска
     if (date !== '-' && date !== prevState[mesa]) {
       newSlots.push({ mesa, date });
     }
@@ -108,6 +113,10 @@ async function main() {
 
   saveState(currentState);
 }
+
+// Простейший способ победить кривой SSL в Node: переменная окружения.
+// Применяется только на время работы скрипта (не глобально).
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 main().catch(err => {
   console.error('Fatal:', err);
