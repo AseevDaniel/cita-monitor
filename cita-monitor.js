@@ -15,6 +15,12 @@ const MESAS_TO_WATCH = ['MESA 1', 'MESA 4', 'MESA 5', 'MESA 6'];
 const STATE_FILE = path.join(__dirname, 'state.json');
 const MAX_REDIRECTS = 10;
 
+// Меняй эту строку на любую новую, когда хочешь получить тестовое сообщение в телегу
+// после следующего запуска. Например: '2026-04-21-v2', 'test1', 'abc'...
+// Скрипт сравнивает с сохранённой в state.json — если отличается, шлёт тест.
+const DEPLOY_VERSION = 'v1';
+// ==========================
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 // ==========================
@@ -190,6 +196,22 @@ function parseStep1(html) {
 }
 
 async function main() {
+  const prevState = loadState();
+
+  // Тестовое сообщение при первом запуске новой версии
+  if (prevState._deployVersion !== DEPLOY_VERSION) {
+    console.log(`[INFO] Новая версия (${prevState._deployVersion || 'none'} → ${DEPLOY_VERSION}), шлю тестовое сообщение`);
+    await sendTelegram(
+      `🚀 <b>Cita monitor задеплоен</b>\n\n` +
+      `Версия: <code>${DEPLOY_VERSION}</code>\n` +
+      `Проверка каждые 10 минут.\n\n` +
+      `Если видишь это — значит уведомления работают. ` +
+      `Когда появятся свободные слоты на empadronamiento, ` +
+      `прилетит отдельное сообщение.`
+    );
+    console.log('[OK] Тестовое сообщение отправлено');
+  }
+
   // Шаг 1: загрузить форму
   console.log('→ GET /citaprevia');
   const step1 = await fetchFollowRedirects(URL_START);
@@ -231,9 +253,14 @@ async function main() {
 
   // Парсим mesa
   const html = step2.body;
-  const prevState = loadState();
-  const currentState = {};
+  const currentState = { _deployVersion: DEPLOY_VERSION };
   const newSlots = [];
+
+  // Считаем что "слот занят" только если значение в точности "-".
+  // ВСЁ остальное (дата, текст, что угодно) трактуем как потенциально интересное.
+  const isNoSlot = v => v === '-' || v === '' || v === undefined;
+  // Похоже ли значение на нормальную дату DD/MM/YYYY
+  const looksLikeDate = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v);
 
   for (const mesa of MESAS_TO_WATCH) {
     const pattern = new RegExp(
@@ -248,15 +275,27 @@ async function main() {
     const date = m[1].trim();
     currentState[mesa] = date;
     console.log(`${mesa}: ${date}`);
-    if (date !== '-' && date !== prevState[mesa]) {
-      newSlots.push({ mesa, date });
+
+    // Уведомляем если:
+    //   - значение не "пусто/прочерк"
+    //   - И оно отличается от прошлого сохранённого (чтоб не спамить)
+    if (!isNoSlot(date) && date !== prevState[mesa]) {
+      newSlots.push({
+        mesa,
+        date,
+        suspicious: !looksLikeDate(date), // отметим если не похоже на дату
+      });
     }
   }
 
   if (newSlots.length > 0) {
+    const lines = newSlots.map(s => {
+      const mark = s.suspicious ? ' ⚠️ (не похоже на дату, проверь сам)' : '';
+      return `• <b>${s.mesa}</b>: ${s.date}${mark}`;
+    });
     const msg =
       `🎉 <b>Появились слоты на empadronamiento!</b>\n\n` +
-      newSlots.map(s => `• <b>${s.mesa}</b>: ${s.date}`).join('\n') +
+      lines.join('\n') +
       `\n\n<a href="${URL_START}">Открыть сайт и записаться</a>\n\n` +
       `⚡ Беги быстро, слоты разбирают за минуты`;
     await sendTelegram(msg);
