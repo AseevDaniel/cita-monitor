@@ -1,17 +1,19 @@
 // cita-monitor.js
 // Мониторинг cita previa на torrevieja.sedelectronica.es
-// Запускается GitHub Actions по cron'у. Одна проверка — один запуск.
+// Использует встроенный https модуль с cookie jar и ручными редиректами,
+// потому что сайт использует сессионные куки через редиректы.
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { URL } = require('url');
 
 // ========= КОНФИГ =========
 const URL_CITA = 'https://torrevieja.sedelectronica.es/citaprevia.2';
 const MESAS_TO_WATCH = ['MESA 1', 'MESA 4', 'MESA 5', 'MESA 6'];
 const STATE_FILE = path.join(__dirname, 'state.json');
+const MAX_REDIRECTS = 10;
 
-// Из GitHub Secrets
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 // ==========================
@@ -21,10 +23,89 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   process.exit(1);
 }
 
-// У torrevieja.sedelectronica.es кривая цепочка сертификатов
-// (не приложен промежуточный). Отключаем проверку только для этого запроса.
-// Безопасно т.к. страница публичная и ничего секретного не передаём.
-const insecureAgent = new https.Agent({ rejectUnauthorized: false });
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+
+// Простейший cookie jar: Map<name, value>
+const cookieJar = new Map();
+
+function updateCookies(setCookieHeaders) {
+  if (!setCookieHeaders) return;
+  const arr = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+  for (const sc of arr) {
+    // Берём только "name=value" до первой точки с запятой, атрибуты типа Path/HttpOnly игнорируем
+    const pair = sc.split(';')[0].trim();
+    const eq = pair.indexOf('=');
+    if (eq > 0) {
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      cookieJar.set(name, value);
+    }
+  }
+}
+
+function cookieHeader() {
+  if (cookieJar.size === 0) return '';
+  return Array.from(cookieJar.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+// Один GET запрос с возвратом статуса, хедеров и тела
+function httpGet(targetUrl) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(targetUrl);
+    const options = {
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'identity', // без gzip — легче обрабатывать
+      },
+      rejectUnauthorized: false, // кривой сертификат у сайта
+    };
+    const cookies = cookieHeader();
+    if (cookies) options.headers['Cookie'] = cookies;
+
+    const req = https.request(options, res => {
+      updateCookies(res.headers['set-cookie']);
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => (data += chunk));
+      res.on('end', () => {
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: data,
+          location: res.headers.location,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => {
+      req.destroy(new Error('Request timeout'));
+    });
+    req.end();
+  });
+}
+
+// GET с ручной обработкой редиректов и накоплением куков
+async function fetchWithCookies(targetUrl) {
+  let current = targetUrl;
+  for (let i = 0; i < MAX_REDIRECTS; i++) {
+    const res = await httpGet(current);
+    if ([301, 302, 303, 307, 308].includes(res.status) && res.location) {
+      const next = new URL(res.location, current).toString();
+      console.log(`  [${res.status}] redirect → ${next}`);
+      current = next;
+      continue;
+    }
+    return res;
+  }
+  throw new Error('Too many redirects');
+}
 
 function loadState() {
   try {
@@ -39,6 +120,7 @@ function saveState(state) {
 }
 
 async function sendTelegram(text) {
+  // Для телеги используем обычный fetch — у api.telegram.org нормальный SSL
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const res = await fetch(url, {
     method: 'POST',
@@ -47,7 +129,6 @@ async function sendTelegram(text) {
       chat_id: TELEGRAM_CHAT_ID,
       text,
       parse_mode: 'HTML',
-      disable_web_page_preview: false,
     }),
   });
   if (!res.ok) {
@@ -60,22 +141,23 @@ function escapeRegex(s) {
 }
 
 async function main() {
-  const res = await fetch(URL_CITA, {
-    headers: {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept-Language': 'es-ES,es;q=0.9',
-    },
-    // undici в Node 18+ принимает dispatcher, но для совместимости проще
-    // через переменную NODE_TLS_REJECT_UNAUTHORIZED — ставим ниже
-  });
+  console.log('Прогрев куков через главную...');
+  // Сначала заходим на корень чтобы получить сессионные куки
+  await fetchWithCookies('https://torrevieja.sedelectronica.es/info.0');
+  console.log('  cookies:', Array.from(cookieJar.keys()).join(', ') || '(нет)');
 
-  if (!res.ok) {
+  console.log('Загружаем страницу cita previa...');
+  const res = await fetchWithCookies(URL_CITA);
+
+  if (res.status !== 200) {
     console.error(`HTTP ${res.status}`);
+    console.error('Первые 500 символов тела:', res.body.slice(0, 500));
     process.exit(1);
   }
 
-  const html = await res.text();
+  const html = res.body;
+  console.log(`  Получено ${html.length} символов HTML`);
+
   const prevState = loadState();
   const currentState = {};
   const newSlots = [];
@@ -113,10 +195,6 @@ async function main() {
 
   saveState(currentState);
 }
-
-// Простейший способ победить кривой SSL в Node: переменная окружения.
-// Применяется только на время работы скрипта (не глобально).
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 main().catch(err => {
   console.error('Fatal:', err);
