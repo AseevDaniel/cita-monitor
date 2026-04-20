@@ -154,13 +154,25 @@ function parseStep1(html) {
   const hiddenMatch = formBody.match(/<input[^>]+type="hidden"[^>]+name="([^"]+_hf_\d+)"/i);
   const hiddenName = hiddenMatch ? hiddenMatch[1] : `${formId}_hf_0`;
 
-  // URL из onclick кнопки Continuar
-  const submitMatch = formBody.match(
-    /<button[^>]+name="next"[^>]*onclick="[^"]*wicketSubmitFormById\('[^']+',\s*'([^']+)'/i
-  );
-  if (!submitMatch) throw new Error('Не найден URL кнопки Continuar на шаге 1');
-  const submitRelative = submitMatch[1].replace(/&amp;/g, '&');
-  const submitUrl = new URL(submitRelative, URL_START).toString();
+  // Находим ВСЕ <button> и ищем тот что с name="next".
+  // Атрибуты могут идти в любом порядке, поэтому не полагаемся на жёсткий паттерн.
+  const buttonTags = formBody.match(/<button\b[^>]*>/gi) || [];
+  let submitUrl = null;
+  for (const tag of buttonTags) {
+    if (!/\bname="next"/i.test(tag)) continue;
+    // В onclick есть wicketSubmitFormById('FORM_ID', 'URL', 'next', ...)
+    // Берём второй аргумент — URL. Учитываем что в HTML &amp;
+    const onclickMatch = tag.match(/wicketSubmitFormById\('[^']+',\s*'([^']+)'/);
+    if (!onclickMatch) continue;
+    submitUrl = new URL(onclickMatch[1].replace(/&amp;/g, '&'), URL_START).toString();
+    break;
+  }
+  if (!submitUrl) {
+    // Диагностика: покажем какие кнопки вообще нашли
+    console.error('Кнопки найденные в форме:');
+    buttonTags.forEach((t, i) => console.error(`  [${i}] ${t}`));
+    throw new Error('Не найден URL кнопки Continuar на шаге 1');
+  }
 
   // Радио для нужной услуги. Формат:
   // <input name="appointmentAttention" ... value="radio22">
