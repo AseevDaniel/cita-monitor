@@ -1,23 +1,14 @@
-// cita-monitor.js
-// Проходит визард /citaprevia шаг 1 (выбор услуги) → шаг 2 (список mesa)
-// и парсит доступность слотов.
-
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const { URL } = require('url');
 
-// ========= КОНФИГ =========
 const BASE = 'https://torrevieja.sedelectronica.es';
 const URL_START = `${BASE}/citaprevia`;
 const TARGET_SERVICE = 'Altas de empadronamiento y cambios de domicilio';
 const MESAS_TO_WATCH = ['MESA 1', 'MESA 4', 'MESA 5', 'MESA 6'];
 const STATE_FILE = path.join(__dirname, 'state.json');
 const MAX_REDIRECTS = 10;
-
-// Меняй эту строку на любую новую, когда хочешь получить тестовое сообщение в телегу
-// после следующего запуска. Например: '2026-04-21-v2', 'test1', 'abc'...
-// Скрипт сравнивает с сохранённой в state.json — если отличается, шлёт тест.
 const DEPLOY_VERSION = 'v1';
 // ==========================
 
@@ -106,7 +97,7 @@ async function fetchFollowRedirects(targetUrl, opts = {}) {
       console.log(`  [${res.status}] ${method} → ${next}`);
       referer = current;
       current = next;
-      // После редиректа переключаемся на GET (кроме 307/308)
+
       if (res.status !== 307 && res.status !== 308) {
         method = 'GET';
         body = null;
@@ -141,48 +132,31 @@ async function sendTelegram(text) {
   if (!res.ok) console.error('Telegram error:', await res.text());
 }
 
-/**
- * Из HTML шага 1 извлекаем:
- *   - formId      (id формы, напр. "idf9")
- *   - hiddenName  (имя Wicket hidden, напр. "idf9_hf_0")
- *   - submitUrl   (URL из onclick кнопки Continuar)
- *   - radioValue  (value радио-кнопки для нужной услуги)
- *   - radioName   (имя поля радио — ожидаем "appointmentAttention")
- */
+
 function parseStep1(html) {
-  // Ищем форму
   const formMatch = html.match(/<form[^>]+id="([^"]+)"[^>]+method="post"[^>]*>([\s\S]*?)<\/form>/i);
   if (!formMatch) throw new Error('Форма не найдена на шаге 1');
   const formId = formMatch[1];
   const formBody = formMatch[2];
 
-  // Hidden поле Wicket (обычно {formId}_hf_0)
   const hiddenMatch = formBody.match(/<input[^>]+type="hidden"[^>]+name="([^"]+_hf_\d+)"/i);
   const hiddenName = hiddenMatch ? hiddenMatch[1] : `${formId}_hf_0`;
 
-  // Находим ВСЕ <button> и ищем тот что с name="next".
-  // Атрибуты могут идти в любом порядке, поэтому не полагаемся на жёсткий паттерн.
   const buttonTags = formBody.match(/<button\b[^>]*>/gi) || [];
   let submitUrl = null;
   for (const tag of buttonTags) {
     if (!/\bname="next"/i.test(tag)) continue;
-    // В onclick есть wicketSubmitFormById('FORM_ID', 'URL', 'next', ...)
-    // Берём второй аргумент — URL. Учитываем что в HTML &amp;
     const onclickMatch = tag.match(/wicketSubmitFormById\('[^']+',\s*'([^']+)'/);
     if (!onclickMatch) continue;
     submitUrl = new URL(onclickMatch[1].replace(/&amp;/g, '&'), URL_START).toString();
     break;
   }
   if (!submitUrl) {
-    // Диагностика: покажем какие кнопки вообще нашли
     console.error('Кнопки найденные в форме:');
     buttonTags.forEach((t, i) => console.error(`  [${i}] ${t}`));
     throw new Error('Не найден URL кнопки Continuar на шаге 1');
   }
 
-  // Радио для нужной услуги. Формат:
-  // <input name="appointmentAttention" ... value="radio22">
-  // <label ...>Altas de empadronamiento y cambios de domicilio</label>
   const re = new RegExp(
     `<input[^>]+name="(appointmentAttention)"[^>]+value="([^"]+)"[^>]*>[\\s\\S]{0,500}?<label[^>]*>${escapeRegex(TARGET_SERVICE)}`,
     'i'
@@ -198,7 +172,6 @@ function parseStep1(html) {
 async function main() {
   const prevState = loadState();
 
-  // Тестовое сообщение при первом запуске новой версии
   if (prevState._deployVersion !== DEPLOY_VERSION) {
     console.log(`[INFO] Новая версия (${prevState._deployVersion || 'none'} → ${DEPLOY_VERSION}), шлю тестовое сообщение`);
     await sendTelegram(
@@ -212,7 +185,6 @@ async function main() {
     console.log('[OK] Тестовое сообщение отправлено');
   }
 
-  // Шаг 1: загрузить форму
   console.log('→ GET /citaprevia');
   const step1 = await fetchFollowRedirects(URL_START);
   if (step1.status !== 200) {
@@ -224,7 +196,6 @@ async function main() {
   const parsed = parseStep1(step1.body);
   console.log(`  formId=${parsed.formId}, hidden=${parsed.hiddenName}, radio=${parsed.radioValue}`);
 
-  // Шаг 2: сабмит формы
   const postBody = new URLSearchParams({
     [parsed.hiddenName]: '',
     [parsed.radioName]: parsed.radioValue,
@@ -244,22 +215,17 @@ async function main() {
   }
   console.log(`  OK, ${step2.body.length} байт, URL: ${step2.finalUrl}`);
 
-  // Проверим что мы реально на шаге 2 (со списком mesa)
   if (!/Seleccionar agenda/i.test(step2.body) && !/MESA \d/.test(step2.body)) {
     console.error('Не похоже на шаг 2 со списком mesa. Первые 1000 символов:');
     console.error(step2.body.slice(0, 1000));
     process.exit(1);
   }
 
-  // Парсим mesa
   const html = step2.body;
   const currentState = { _deployVersion: DEPLOY_VERSION };
   const newSlots = [];
 
-  // Считаем что "слот занят" только если значение в точности "-".
-  // ВСЁ остальное (дата, текст, что угодно) трактуем как потенциально интересное.
   const isNoSlot = v => v === '-' || v === '' || v === undefined;
-  // Похоже ли значение на нормальную дату DD/MM/YYYY
   const looksLikeDate = v => /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(v);
 
   for (const mesa of MESAS_TO_WATCH) {
@@ -276,14 +242,11 @@ async function main() {
     currentState[mesa] = date;
     console.log(`${mesa}: ${date}`);
 
-    // Уведомляем если:
-    //   - значение не "пусто/прочерк"
-    //   - И оно отличается от прошлого сохранённого (чтоб не спамить)
     if (!isNoSlot(date) && date !== prevState[mesa]) {
       newSlots.push({
         mesa,
         date,
-        suspicious: !looksLikeDate(date), // отметим если не похоже на дату
+        suspicious: !looksLikeDate(date),
       });
     }
   }
